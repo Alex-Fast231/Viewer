@@ -298,7 +298,11 @@ let uiState = {
   stundenMode: {},    // pro Therapeut: "tag" | "zeitraum"
   stundenDate: {},    // pro Therapeut: gewähltes Einzeldatum (Tag-Modus)
   stundenFrom: {},    // pro Therapeut: Zeitraum-Start
-  stundenTo: {}       // pro Therapeut: Zeitraum-Ende
+  stundenTo: {},      // pro Therapeut: Zeitraum-Ende
+  druckenBereich: {}, // pro Therapeut: gewählter Druck-Bereich (siehe DRUCKEN_BEREICHE)
+  druckenMode: {},    // pro Therapeut: "gesamt" | "zeitraum"
+  druckenFrom: {},    // pro Therapeut: Druck-Zeitraum-Start
+  druckenTo: {}       // pro Therapeut: Druck-Zeitraum-Ende
 };
 
 function getStateSet(bucket, therapistId) {
@@ -420,6 +424,14 @@ function isDateInRange(dateValue, fromDate, toDate) {
   if (from && current < from) return false;
   if (to && current > to) return false;
   return true;
+}
+// Für Felder, die im Datenmodell als ISO-String vorliegen (z.B. createdAt bei
+// Abgabelisten/Therapieberichten) - erst in TT.MM.JJJJ umwandeln, dann mit
+// isDateInRange() prüfen, das ausschließlich dieses Format erwartet.
+function isIsoDateInRange(isoValue, fromDate, toDate) {
+  const de = formatDeDate(String(isoValue || "").slice(0, 10));
+  if (!de) return false;
+  return isDateInRange(de, fromDate, toDate);
 }
 function listComparableDatesInRange(fromDate, toDate) {
   const from = parseDeDate(fromDate);
@@ -973,6 +985,298 @@ function renderStundenTab(therapist) {
   `;
 }
 
+// ============================================================
+// Reiter "Drucken": therapeutenweite Übersichten je Bereich, wahlweise für
+// die gesamte gespeicherte Historie oder einen gewählten Zeitraum, die sich
+// in einem eigenen Druck-Fenster öffnen (analog zum Druck-Fenster-Stil der
+// Haupt-App, siehe openHtmlDocument() in ui/views.js).
+// ============================================================
+const DRUCKEN_BEREICHE = [
+  { val: "rezepte", label: "Rezeptübersicht" },
+  { val: "patienten", label: "Patientenübersicht" },
+  { val: "befreiungen", label: "Befreiungen" },
+  { val: "stunden", label: "Stunden" },
+  { val: "abgabelisten", label: "Abgabelisten" },
+  { val: "kilometer", label: "Kilometer" },
+  { val: "therapieberichte", label: "Therapieberichte" },
+  { val: "assessments", label: "Assessments" }
+];
+
+const DRUCKEN_COLUMNS = {
+  rezepte: [["patient", "Patient"], ["heim", "Heim"], ["heilmittel", "Heilmittel"], ["anzahl", "Anzahl"], ["ausstell", "Ausstellung"], ["arzt", "Arzt"]],
+  patienten: [["patient", "Patient"], ["geburtsdatum", "Geburtsdatum"], ["heim", "Heim"], ["zuzahlung", "Zuzahlungsstatus"], ["rezepteAnzahl", "Rezepte im Zeitraum"], ["heilmittel", "Heilmittel im Zeitraum"]],
+  befreiungen: [["patient", "Patient"], ["geburtsdatum", "Geburtsdatum"], ["heim", "Heim"], ["seit", "Befreit seit"]],
+  abgabelisten: [["liste", "Liste"], ["erstellt", "Erstellt"], ["patient", "Patient"], ["heim", "Heim"], ["leistung", "Leistung"], ["ausstell", "Ausstellung"]],
+  kilometer: [["datum", "Datum"], ["von", "Von"], ["nach", "Nach"], ["km", "Km"], ["status", "Status"]],
+  therapieberichte: [["patient", "Patient"], ["heim", "Heim"], ["datum", "Datum"], ["inhalt", "Inhalt"]],
+  assessments: [["patient", "Patient"], ["heim", "Heim"], ["datum", "Datum"], ["ergebnis", "Ergebnis"]]
+};
+
+function fullPatientName(patient) {
+  return `${patient.lastName || ""}, ${patient.firstName || ""}`.replace(/^,\s*/, "").trim() || "Ohne Namen";
+}
+
+function collectRezeptRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = [];
+  (therapist.homes || []).forEach((home) => {
+    (home.patients || []).forEach((patient) => {
+      (patient.rezepte || []).forEach((rezept) => {
+        if (applyFilter && !isDateInRange(rezept.ausstell, fromDate, toDate)) return;
+        rows.push({
+          patient: fullPatientName(patient),
+          heim: home.name || "—",
+          heilmittel: (rezept.items || []).map((i) => i.type).join(", ") || "—",
+          anzahl: (rezept.items || []).map((i) => i.count).filter(Boolean).join(", ") || "—",
+          ausstell: rezept.ausstell || "—",
+          arzt: rezept.arzt || "—"
+        });
+      });
+    });
+  });
+  rows.sort((a, b) => compareDeDatesDesc(a.ausstell, b.ausstell));
+  return rows;
+}
+
+function collectPatientenRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = [];
+  (therapist.homes || []).forEach((home) => {
+    (home.patients || []).forEach((patient) => {
+      const rezepteInRange = (patient.rezepte || []).filter((r) => !applyFilter || isDateInRange(r.ausstell, fromDate, toDate));
+      if (applyFilter && rezepteInRange.length === 0) return;
+      const heilmittel = Array.from(new Set(rezepteInRange.flatMap((r) => (r.items || []).map((i) => i.type)))).join(", ");
+      rows.push({
+        patient: fullPatientName(patient),
+        geburtsdatum: patient.birthDate || "—",
+        heim: home.name || "—",
+        zuzahlung: renderZuzahlungLabel(patient.zuzahlungsstatus),
+        rezepteAnzahl: rezepteInRange.length,
+        heilmittel: heilmittel || "—"
+      });
+    });
+  });
+  rows.sort((a, b) => a.patient.localeCompare(b.patient, "de"));
+  return rows;
+}
+
+function collectBefreiungenRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = [];
+  getBefreitePatientsForTherapist(therapist).forEach(({ home, patient }) => {
+    if (applyFilter && patient.zuzahlungsstatusSetAt && !isIsoDateInRange(patient.zuzahlungsstatusSetAt, fromDate, toDate)) return;
+    rows.push({
+      patient: fullPatientName(patient),
+      geburtsdatum: patient.birthDate || "—",
+      heim: home.name || "—",
+      seit: patient.zuzahlungsstatusSetAt ? formatDeDate(String(patient.zuzahlungsstatusSetAt).slice(0, 10)) : "—"
+    });
+  });
+  return rows;
+}
+
+function collectAbgabelistenRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = [];
+  (therapist.abgabeHistory || []).forEach((entry) => {
+    if (applyFilter && !isIsoDateInRange(entry.createdAt, fromDate, toDate)) return;
+    (entry.rows || []).forEach((row) => {
+      rows.push({
+        liste: entry.title || "Abgabeliste",
+        erstellt: formatDeDate(String(entry.createdAt || "").slice(0, 10)) || "—",
+        patient: `${row.patientLastName || ""}${row.patientFirstName ? ", " + row.patientFirstName : ""}`.trim() || row.patient || "—",
+        heim: row.heim || "—",
+        leistung: row.leistung || "—",
+        ausstell: row.ausstell || "—"
+      });
+    });
+  });
+  return rows;
+}
+
+function collectKilometerRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = (therapist.kilometer?.travelLog || []).filter((k) => !applyFilter || isDateInRange(k.date, fromDate, toDate));
+  return rows.map((k) => ({
+    datum: k.date || "—",
+    von: k.fromLabel || "—",
+    nach: k.toLabel || "—",
+    km: k.km ?? "—",
+    status: k.abgerechnet ? "Abgegeben" : "Offen"
+  })).sort((a, b) => compareDeDatesDesc(a.datum, b.datum));
+}
+
+function collectTherapieberichteRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = [];
+  (therapist.homes || []).forEach((home) => {
+    (home.patients || []).forEach((patient) => {
+      (patient.rezepte || []).forEach((rezept) => {
+        (rezept.doctorReports || []).forEach((rep) => {
+          if (applyFilter && !isIsoDateInRange(rep.createdAt, fromDate, toDate)) return;
+          rows.push({
+            patient: fullPatientName(patient),
+            heim: home.name || "—",
+            datum: formatDeDate(String(rep.createdAt || "").slice(0, 10)) || "—",
+            inhalt: rep.content || "—"
+          });
+        });
+      });
+    });
+  });
+  rows.sort((a, b) => compareDeDatesDesc(a.datum, b.datum));
+  return rows;
+}
+
+function collectAssessmentRowsForPrint(therapist, fromDate, toDate, applyFilter) {
+  const rows = [];
+  (therapist.homes || []).forEach((home) => {
+    (home.patients || []).forEach((patient) => {
+      (patient.assessments || []).forEach((a) => {
+        const de = formatDeDate(a.date);
+        if (applyFilter && !isDateInRange(de, fromDate, toDate)) return;
+        rows.push({
+          patient: fullPatientName(patient),
+          heim: home.name || "—",
+          datum: de || "—",
+          ergebnis: a.content || "—"
+        });
+      });
+    });
+  });
+  rows.sort((a, b) => compareDeDatesDesc(a.datum, b.datum));
+  return rows;
+}
+
+function buildGenericTableHtml(columns, rows) {
+  if (rows.length === 0) return '<p class="muted">Keine Einträge im gewählten Zeitraum.</p>';
+  return `
+    <table>
+      <tr>${columns.map(([, label]) => `<th>${esc(label)}</th>`).join("")}</tr>
+      ${rows.map((row) => `<tr>${columns.map(([key]) => `<td>${esc(row[key] ?? "—")}</td>`).join("")}</tr>`).join("")}
+    </table>
+  `;
+}
+
+const DRUCKEN_COLLECTORS = {
+  rezepte: collectRezeptRowsForPrint,
+  patienten: collectPatientenRowsForPrint,
+  befreiungen: collectBefreiungenRowsForPrint,
+  abgabelisten: collectAbgabelistenRowsForPrint,
+  kilometer: collectKilometerRowsForPrint,
+  therapieberichte: collectTherapieberichteRowsForPrint,
+  assessments: collectAssessmentRowsForPrint
+};
+
+function buildDruckenOutput(therapist, bereich, mode, fromDate, toDate) {
+  const applyFilter = mode === "zeitraum";
+  const bereichInfo = DRUCKEN_BEREICHE.find((b) => b.val === bereich) || DRUCKEN_BEREICHE[0];
+  const subtitle = applyFilter ? `Zeitraum: ${fromDate} bis ${toDate}` : "Gesamter Zeitraum";
+
+  if (bereich === "stunden") {
+    const settings = therapist.settings || {};
+    const fastStartComparable = getFastStartDatumComparable(settings);
+    const todayDe = formatDeDate(getComparableFromDate(new Date()));
+    const effectiveFrom = applyFilter ? fromDate : (fastStartComparable ? formatDeDate(fastStartComparable) : todayDe);
+    const effectiveTo = applyFilter ? toDate : todayDe;
+    const summary = getTimePeriodSummaryForViewer(therapist, effectiveFrom, effectiveTo);
+    const patientRowsWithLabel = summary.patientRows.map((r) => ({ ...r, totalMinutesLabel: formatMinutesLabel(r.totalMinutes) }));
+    const bodyHtml = `
+      <table>
+        <tr><th>Soll-Zeit</th><td>${esc(formatHoursClockLabel(summary.plannedMinutes))}</td></tr>
+        <tr><th>Ist-Zeit</th><td>${esc(formatHoursClockLabel(summary.totalMinutes))}</td></tr>
+        <tr><th>Zeitraum-Saldo</th><td>${esc(formatHoursClockLabel(Math.abs(summary.appSaldoMinutes)))} ${summary.appSaldoMinutes > 0 ? "Plus" : summary.appSaldoMinutes < 0 ? "Minus" : "Ausgeglichen"}</td></tr>
+        <tr><th>Startsaldo vor App/FaSt</th><td>${esc(getSignedMinutesLabel(summary.stundenStartsaldoMinuten))}</td></tr>
+        <tr><th>Gesamt-Stundensaldo</th><td style="font-weight:700;">${esc(getSignedMinutesLabel(summary.saldoMinutes))}</td></tr>
+      </table>
+      <h4>Patienten im Zeitraum</h4>
+      ${buildGenericTableHtml(
+        [["patientName", "Patient"], ["birthDate", "Geburtsdatum"], ["homeName", "Heim"], ["totalMinutesLabel", "Zeit gesamt"]],
+        patientRowsWithLabel
+      )}
+    `;
+    return { title: bereichInfo.label, subtitle, bodyHtml, count: summary.patientRows.length };
+  }
+
+  const collector = DRUCKEN_COLLECTORS[bereich];
+  const rows = collector ? collector(therapist, fromDate, toDate, applyFilter) : [];
+  const columns = DRUCKEN_COLUMNS[bereich] || [];
+  const bodyHtml = buildGenericTableHtml(columns, rows);
+  return { title: bereichInfo.label, subtitle, bodyHtml, count: rows.length };
+}
+
+// Druck-Fenster im Stil der Haupt-App (siehe openHtmlDocument() in
+// ui/views.js) - eigenständiges HTML-Dokument in einem neuen Fenster, mit
+// "Drucken"/"Schließen"-Leiste, die beim tatsächlichen Drucken ausgeblendet
+// wird.
+function openViewerPrintWindow(therapist, title, subtitle, bodyHtml, count) {
+  const win = window.open("", "_blank", "width=900,height=700");
+  if (!win) return false;
+  const html = `
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+      <meta charset="UTF-8">
+      <title>${esc(title)} - ${esc(therapist.therapistName)}</title>
+      <style>
+        body{ font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; padding:24px; color:#0f172a; }
+        h1{ font-size:20px; margin:0 0 4px; }
+        p.subtitle{ margin:0 0 20px; color:#64748b; font-size:13px; }
+        table{ width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+        th, td{ border:1px solid #dbe3ee; padding:6px 8px; text-align:left; }
+        th{ background:#f3f4f6; }
+        .print-actions{ margin-bottom:20px; }
+        .print-actions button{ padding:10px 16px; border:none; border-radius:8px; background:#2563eb; color:#fff; font-weight:600; cursor:pointer; font-size:14px; margin-right:10px; }
+        .print-actions button.secondary{ background:#475569; }
+        @media print{ .print-actions{ display:none; } }
+      </style>
+    </head>
+    <body>
+      <div class="print-actions">
+        <button onclick="window.print()">Drucken / als PDF speichern</button>
+        <button class="secondary" onclick="window.close()">Schließen</button>
+      </div>
+      <h1>${esc(title)}</h1>
+      <p class="subtitle">${esc(therapist.therapistName)} · ${esc(subtitle)} · ${count} Eintrag/Einträge</p>
+      ${bodyHtml}
+    </body>
+    </html>
+  `;
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  return true;
+}
+
+function renderDruckenTab(therapist) {
+  const tid = therapist.therapistId;
+  const bereich = uiState.druckenBereich[tid] || DRUCKEN_BEREICHE[0].val;
+  const mode = uiState.druckenMode[tid] || "gesamt";
+  const todayDe = formatDeDate(getComparableFromDate(new Date()));
+  const fromDate = uiState.druckenFrom[tid] || todayDe;
+  const toDate = uiState.druckenTo[tid] || todayDe;
+
+  return `
+    <div class="card">
+      <h3 style="margin-top:0;">Drucken</h3>
+      <label for="druckenBereichSelect">Bereich</label>
+      <select id="druckenBereichSelect" class="druckenBereichSelect">
+        ${DRUCKEN_BEREICHE.map((b) => `<option value="${esc(b.val)}" ${b.val === bereich ? "selected" : ""}>${esc(b.label)}</option>`).join("")}
+      </select>
+
+      <div class="row">
+        <button class="druckenModeBtn ${mode === "gesamt" ? "" : "secondary"}" data-mode="gesamt" style="flex:1;">Gesamter Zeitraum</button>
+        <button class="druckenModeBtn ${mode === "zeitraum" ? "" : "secondary"}" data-mode="zeitraum" style="flex:1;">Zeitraum</button>
+      </div>
+      ${mode === "zeitraum" ? `
+        <label for="druckenFromInput">Von</label>
+        <input id="druckenFromInput" class="druckenFromInput" type="text" inputmode="numeric" placeholder="TT.MM.JJJJ" value="${esc(fromDate)}">
+        <label for="druckenToInput">Bis</label>
+        <input id="druckenToInput" class="druckenToInput" type="text" inputmode="numeric" placeholder="TT.MM.JJJJ" value="${esc(toDate)}">
+      ` : ""}
+
+      <div class="row">
+        <button id="druckenAusfuehrenBtn">🖨️ Drucken / Vorschau</button>
+      </div>
+      <div id="druckenMsg" class="error"></div>
+    </div>
+  `;
+}
+
 function renderTherapistBody(therapist) {
   const tid = therapist.therapistId;
   const tab = uiState.activeTab[tid] || "patienten";
@@ -1013,6 +1317,8 @@ function renderTherapistBody(therapist) {
     listHtml = renderAbgabelistenTab(therapist);
   } else if (tab === "stunden") {
     listHtml = renderStundenTab(therapist);
+  } else if (tab === "drucken") {
+    listHtml = renderDruckenTab(therapist);
   }
 
   return `
@@ -1025,6 +1331,9 @@ function renderTherapistBody(therapist) {
       <button class="tabBtn ${tab === "kilometer" ? "active" : ""}" data-tab="kilometer">Kilometer</button>
       <button class="tabBtn ${tab === "abgabelisten" ? "active" : ""}" data-tab="abgabelisten">Abgabelisten</button>
       <button class="tabBtn ${tab === "stunden" ? "active" : ""}" data-tab="stunden">Stunden</button>
+    </div>
+    <div class="tab-row">
+      <button class="tabBtn ${tab === "drucken" ? "active" : ""}" data-tab="drucken">🖨️ Drucken</button>
     </div>
     ${extraControlsHtml}
     ${hasSearch ? `<input type="text" class="searchInput" placeholder="Suche..." value="${esc(uiState.searchText[tid] || "")}">` : ""}
@@ -1215,6 +1524,68 @@ function bindBodyEvents(therapist) {
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     });
+  }
+
+  body.querySelectorAll(".druckenModeBtn").forEach((btn) => {
+    btn.onclick = () => {
+      uiState.druckenMode[therapist.therapistId] = btn.dataset.mode;
+      body.innerHTML = renderTherapistBody(therapist);
+      bindBodyEvents(therapist);
+    };
+  });
+
+  const druckenBereichSelect = body.querySelector(".druckenBereichSelect");
+  if (druckenBereichSelect) {
+    druckenBereichSelect.onchange = () => {
+      uiState.druckenBereich[therapist.therapistId] = druckenBereichSelect.value;
+    };
+  }
+
+  const druckenFromInput = body.querySelector(".druckenFromInput");
+  if (druckenFromInput) {
+    bindDeDateAutoFormat(druckenFromInput);
+    druckenFromInput.addEventListener("change", () => {
+      uiState.druckenFrom[therapist.therapistId] = druckenFromInput.value.trim();
+    });
+  }
+  const druckenToInput = body.querySelector(".druckenToInput");
+  if (druckenToInput) {
+    bindDeDateAutoFormat(druckenToInput);
+    druckenToInput.addEventListener("change", () => {
+      uiState.druckenTo[therapist.therapistId] = druckenToInput.value.trim();
+    });
+  }
+
+  const druckenAusfuehrenBtn = body.querySelector("#druckenAusfuehrenBtn");
+  if (druckenAusfuehrenBtn) {
+    druckenAusfuehrenBtn.onclick = () => {
+      const tid = therapist.therapistId;
+      const msg = body.querySelector("#druckenMsg");
+      msg.textContent = "";
+      const bereich = uiState.druckenBereich[tid] || DRUCKEN_BEREICHE[0].val;
+      const mode = uiState.druckenMode[tid] || "gesamt";
+      let fromDate = "";
+      let toDate = "";
+      if (mode === "zeitraum") {
+        fromDate = (uiState.druckenFrom[tid] || "").trim();
+        toDate = (uiState.druckenTo[tid] || "").trim();
+        const fromComparable = parseDeDate(fromDate);
+        const toComparable = parseDeDate(toDate);
+        if (!fromComparable || !toComparable) {
+          msg.textContent = "Bitte ein gültiges Von- und Bis-Datum (TT.MM.JJJJ) angeben.";
+          return;
+        }
+        if (fromComparable > toComparable) {
+          msg.textContent = "Das Von-Datum darf nicht nach dem Bis-Datum liegen.";
+          return;
+        }
+      }
+      const output = buildDruckenOutput(therapist, bereich, mode, fromDate, toDate);
+      const opened = openViewerPrintWindow(therapist, output.title, output.subtitle, output.bodyHtml, output.count);
+      if (!opened) {
+        msg.textContent = "Popup wurde vom Browser blockiert. Bitte Popups für diese Seite erlauben.";
+      }
+    };
   }
 }
 
