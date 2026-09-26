@@ -267,9 +267,37 @@ function saveStore(store) {
   localStorage.setItem(STORE_KEY, JSON.stringify(store));
 }
 
-function mergeAppDataIntoStore(store, appData) {
-  const therapistId = appData.settings?.therapistId || "unbekannt";
+// Ältere Backups (vor Einführung von settings.therapistId in der Haupt-App)
+// enthalten dieses Feld gar nicht - ein fester Platzhalter wie "unbekannt"
+// als Fallback würde ALLE solchen Alt-Backups unter demselben Schlüssel
+// speichern und damit verschiedene Therapeuten gegenseitig überschreiben
+// (genau das war der gemeldete Bug: Lilly + Emilio landeten beide unter
+// "unbekannt", der zuletzt importierte hat den vorherigen ersetzt statt
+// getrennt daneben zu stehen). Fallback deshalb auf den Therapeutennamen
+// selbst (stabil über mehrere Importe derselben Person hinweg, und von
+// echten therapistId-Werten durch das Präfix "legacy-name-" klar
+// unterscheidbar) - trennt unterschiedliche Namen zuverlässig, sofern
+// innerhalb einer Praxis nicht zwei Personen exakt denselben Namen haben.
+function slugifyTherapistName(name) {
+  return String(name || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "unbekannt";
+}
+
+function resolveTherapistId(appData) {
   const therapistName = appData.settings?.therapistName || "Unbekannter Therapeut";
+  return appData.settings?.therapistId || `legacy-name-${slugifyTherapistName(therapistName)}`;
+}
+
+function mergeAppDataIntoStore(store, appData) {
+  const therapistName = appData.settings?.therapistName || "Unbekannter Therapeut";
+  const therapistId = resolveTherapistId(appData);
   const existing = store.therapists[therapistId] || { therapistId, therapistName, homes: [], aerzte: [], nachbestellHistory: [] };
 
   const existingHomesById = new Map((existing.homes || []).map((h) => [h.homeId, h]));
@@ -1434,6 +1462,10 @@ function renderTherapistBody(therapist) {
     ${extraControlsHtml}
     ${hasSearch ? `<input type="text" class="searchInput" placeholder="Suche..." value="${esc(uiState.searchText[tid] || "")}">` : ""}
     <div style="margin-top:12px;">${listHtml}</div>
+
+    <div class="row" style="margin-top:24px; border-top:1px solid var(--border); padding-top:14px;">
+      <button class="deleteTherapistBtn danger" data-therapist-id="${esc(tid)}">Diesen Therapeuten aus dem Viewer löschen</button>
+    </div>
   `;
 }
 
@@ -1496,7 +1528,7 @@ function bindEvents(therapists) {
       const { appData } = await readExportFile(file, secret);
       store = mergeAppDataIntoStore(store, appData);
       saveStore(store);
-      uiState.expandedTherapist = appData.settings?.therapistId || null;
+      uiState.expandedTherapist = resolveTherapistId(appData);
       msg.className = "muted";
       msg.textContent = "Datei erfolgreich geladen und abgeglichen.";
       render();
@@ -1531,6 +1563,21 @@ function bindEvents(therapists) {
 function bindBodyEvents(therapist) {
   const body = document.getElementById(`therapist-body-${therapist.therapistId}`);
   if (!body) return;
+
+  const deleteBtn = body.querySelector(".deleteTherapistBtn");
+  if (deleteBtn) {
+    deleteBtn.onclick = () => {
+      const confirmed = confirm(
+        `Alle im Viewer gespeicherten Daten von "${therapist.therapistName}" wirklich löschen?\n\n` +
+        `Das betrifft nur diese lokale Browser-Kopie, nicht die App selbst - kann jederzeit durch erneutes Einspielen einer Backup-Datei wiederhergestellt werden.`
+      );
+      if (!confirmed) return;
+      delete store.therapists[therapist.therapistId];
+      saveStore(store);
+      if (uiState.expandedTherapist === therapist.therapistId) uiState.expandedTherapist = null;
+      render();
+    };
+  }
 
   body.querySelectorAll(".tabBtn").forEach((btn) => {
     btn.onclick = () => {
