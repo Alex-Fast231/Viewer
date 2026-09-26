@@ -53,7 +53,7 @@
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div>
       <h1>FaSt-Doku Viewer</h1>
-      <p>Läuft lokal, ohne Internetverbindung. Lädt die täglichen, PIN-geschützten Backup-ZIPs aus der FaSt-Doku App ein. Gespeicherte Daten sind bei jedem Öffnen zusätzlich mit einer PIN gesperrt.</p>
+      <p>Läuft lokal, ohne Internetverbindung. Lädt die Backup-ZIPs aus der FaSt-Doku App ein - sowohl aktuelle (PIN-geschützte) als auch ältere, mit dem damaligen Praxis-Passwort geschützte Dateien. Gespeicherte Daten sind bei jedem Öffnen zusätzlich mit einer PIN gesperrt.</p>
     </div>
     <button id="hardRefreshBtn" class="secondary" style="flex-shrink:0; white-space:nowrap;">🔄 Aktualisieren</button>
   </div>
@@ -63,14 +63,106 @@
 <script src="./zip-full.min.js"></script>
 <script type="module">
 // ============================================================
-// Export-Datei laden: die ZIP enthält eine einzige Datei (appData.json)
-// mit dem vollständigen, unverschlüsselten JSON-Stand aller App-Daten,
-// nur durch die ZIP-eigene Passwortverschlüsselung (mit der PIN) vor
-// zufälligem Mitlesen geschützt - siehe modules/backupReminder.js in der
-// Haupt-App, das dieses Format erzeugt (Download bzw. mailto durch den
-// Therapeuten, kein automatischer Versand).
+// Export-Datei laden. Zwei Formate werden unterstützt:
+//
+// 1) AKTUELLES Format: die ZIP enthält appData.json - den vollständigen,
+//    unverschlüsselten JSON-Stand aller App-Daten, nur durch die ZIP-eigene
+//    Passwortverschlüsselung (mit der festen PIN "1550") geschützt - siehe
+//    modules/backupReminder.js in der Haupt-App, das dieses Format erzeugt.
+//
+// 2) ÄLTERES Format (Backups von vor Einführung dieser Viewer-PIN): die ZIP
+//    enthält appData.enc + cryptoMeta.json statt appData.json - denselben
+//    zweistufigen Kryptostapel wie die Haupt-App selbst (siehe
+//    crypto/crypto-engine.js + crypto/key-management.js dort): die
+//    ZIP-Einträge sind mit dem damaligen Praxis-Passwort verschlüsselt, UND
+//    appData.enc ist zusätzlich mit einem eigenen Daten-Schlüssel per
+//    AES-GCM verschlüsselt, der in cryptoMeta.json per PBKDF2-Schlüssel aus
+//    Passwort ODER PIN eingewickelt ("wrapped") ist. Die Funktionen unten
+//    sind eine 1:1-Portierung der entsprechenden Haupt-App-Logik, damit der
+//    eigenständige Viewer (kein Build-Schritt, keine Imports) auch diese
+//    alten Dateien öffnen kann.
 // ============================================================
-async function readExportFile(file, pin) {
+function base64ToUint8ForLegacyDecrypt(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveKeyFromSecretForLegacyDecrypt(secret, saltBase64) {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), "PBKDF2", false, ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: base64ToUint8ForLegacyDecrypt(saltBase64), iterations: 250000, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+}
+
+async function aesGcmDecryptJSONForLegacyDecrypt(payload, cryptoKey) {
+  const iv = base64ToUint8ForLegacyDecrypt(payload.ivBase64);
+  const cipherBytes = base64ToUint8ForLegacyDecrypt(payload.cipherBase64);
+  const plainBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, cipherBytes);
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(plainBuffer)));
+}
+
+async function unwrapDataKeyForLegacyDecrypt(wrappedPayload, secret, saltBase64) {
+  const secretKey = await deriveKeyFromSecretForLegacyDecrypt(secret, saltBase64);
+  const result = await aesGcmDecryptJSONForLegacyDecrypt(
+    { ivBase64: wrappedPayload.ivBase64, cipherBase64: wrappedPayload.wrappedKeyBase64 },
+    secretKey
+  );
+  const rawKeyBytes = base64ToUint8ForLegacyDecrypt(result.rawKeyBase64);
+  return crypto.subtle.importKey("raw", rawKeyBytes, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+}
+
+// Liefert null, wenn die ZIP gar kein appData.enc enthält (dann ist es
+// weder das neue noch das alte Format - fällt an readExportFile() zurück,
+// das dann den generischen "keine gültige Exportdatei"-Fehler wirft).
+async function decryptLegacyAppData(entries, zipLib, secret) {
+  const appEntry = entries.find((e) => e.filename === "appData.enc");
+  const cryptoEntry = entries.find((e) => e.filename === "cryptoMeta.json");
+  if (!appEntry || !cryptoEntry) return null;
+
+  let cryptoMeta;
+  let encryptedAppData;
+  try {
+    cryptoMeta = JSON.parse(await cryptoEntry.getData(new zipLib.TextWriter(), { password: secret }));
+    encryptedAppData = JSON.parse(await appEntry.getData(new zipLib.TextWriter(), { password: secret }));
+  } catch {
+    throw new Error("Falsches Passwort/falsche PIN oder beschädigte Datei.");
+  }
+
+  // Das eingegebene Geheimnis könnte entweder das damalige Praxis-Passwort
+  // oder die numerische PIN sein - beide wickeln denselben Daten-Schlüssel
+  // nur mit unterschiedlichem Salt ein, deshalb wird hier einfach beides
+  // der Reihe nach versucht.
+  let dataKey = null;
+  if (cryptoMeta.wrappedDataKeyByPassword && cryptoMeta.passwordSaltBase64) {
+    try {
+      dataKey = await unwrapDataKeyForLegacyDecrypt(cryptoMeta.wrappedDataKeyByPassword, secret, cryptoMeta.passwordSaltBase64);
+    } catch { /* nächsten Versuch mit PIN-Salt probieren */ }
+  }
+  if (!dataKey && cryptoMeta.wrappedDataKeyByPIN && cryptoMeta.pinSaltBase64) {
+    try {
+      dataKey = await unwrapDataKeyForLegacyDecrypt(cryptoMeta.wrappedDataKeyByPIN, secret, cryptoMeta.pinSaltBase64);
+    } catch { /* unten einheitlich behandelt */ }
+  }
+  if (!dataKey) {
+    throw new Error("Falsches Passwort/falsche PIN für diese ältere Backup-Datei.");
+  }
+
+  try {
+    return await aesGcmDecryptJSONForLegacyDecrypt(encryptedAppData, dataKey);
+  } catch {
+    throw new Error("Backup-Datei konnte nicht entschlüsselt werden (beschädigt?).");
+  }
+}
+
+async function readExportFile(file, secret) {
   const zipLib = window.zip;
   if (!zipLib) throw new Error("ZIP-Bibliothek nicht geladen.");
 
@@ -79,18 +171,22 @@ async function readExportFile(file, pin) {
     const entries = await reader.getEntries();
     const appEntry = entries.find((e) => e.filename === "appData.json");
 
-    if (!appEntry) {
-      throw new Error("Datei ist keine gültige FaSt-Doku Viewer-Exportdatei.");
+    if (appEntry) {
+      let appData;
+      try {
+        appData = JSON.parse(await appEntry.getData(new zipLib.TextWriter(), { password: secret }));
+      } catch {
+        throw new Error("Falsche PIN oder beschädigte Datei.");
+      }
+      return { appData };
     }
 
-    let appData;
-    try {
-      appData = JSON.parse(await appEntry.getData(new zipLib.TextWriter(), { password: pin }));
-    } catch {
-      throw new Error("Falsche PIN oder beschädigte Datei.");
+    const legacyAppData = await decryptLegacyAppData(entries, zipLib, secret);
+    if (legacyAppData) {
+      return { appData: legacyAppData };
     }
 
-    return { appData };
+    throw new Error("Datei ist keine gültige FaSt-Doku Viewer-Exportdatei.");
   } finally {
     await reader.close();
   }
@@ -1349,8 +1445,9 @@ function render() {
       <h2>Export-Datei laden</h2>
       <label for="fileInput">Export-ZIP (.zip)</label>
       <input id="fileInput" type="file" accept=".zip">
-      <label for="pinInput">PIN</label>
-      <input id="pinInput" type="password" inputmode="numeric" autocomplete="off">
+      <label for="pinInput">PIN / Passwort</label>
+      <input id="pinInput" type="password" autocomplete="off">
+      <p class="muted" style="margin-top:4px;">Bei aktuellen Backups die feste PIN <b>1550</b> eingeben. Bei älteren Backups (vor Einführung dieser PIN) stattdessen das damalige Praxis-Passwort.</p>
       <div class="row">
         <button id="loadBtn">Datei laden</button>
       </div>
@@ -1384,19 +1481,19 @@ function bindEvents(therapists) {
     msg.textContent = "";
 
     const file = fileInput.files?.[0];
-    const pin = pinInput.value;
+    const secret = pinInput.value;
 
     if (!file) {
       msg.textContent = "Bitte eine Datei auswählen.";
       return;
     }
-    if (!pin) {
-      msg.textContent = "Bitte die PIN eingeben.";
+    if (!secret) {
+      msg.textContent = "Bitte die PIN oder das Passwort eingeben.";
       return;
     }
 
     try {
-      const { appData } = await readExportFile(file, pin);
+      const { appData } = await readExportFile(file, secret);
       store = mergeAppDataIntoStore(store, appData);
       saveStore(store);
       uiState.expandedTherapist = appData.settings?.therapistId || null;
