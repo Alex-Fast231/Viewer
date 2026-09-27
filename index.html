@@ -295,9 +295,38 @@ function resolveTherapistId(appData) {
   return appData.settings?.therapistId || `legacy-name-${slugifyTherapistName(therapistName)}`;
 }
 
+// Bestandstherapeuten, die bisher nur unter dem namensbasierten
+// Alt-Backup-Schlüssel (legacy-name-...) gespeichert sind, bekommen früher
+// oder später eine App-Version mit echter settings.therapistId - ohne
+// diesen Abgleich würde beim ersten Import mit der neuen, echten ID ein
+// ZWEITER, doppelter Eintrag für dieselbe Person entstehen (z.B. "Lilly
+// Koch" zweimal), statt dass die bisherige Historie weitergeführt wird.
+// Wird deshalb einmalig ausgeführt, sobald eine noch unbekannte ECHTE
+// therapistId auftaucht: existiert dafür bereits ein namensgleicher
+// Alt-Eintrag, wird dessen komplette bisherige Historie unter dem neuen,
+// echten Schlüssel weitergeführt (nicht kopiert - der alte Schlüssel wird
+// dabei entfernt), sodass die anschließende normale Merge-Logik die neuen
+// Daten ganz regulär dazu ergänzt statt zu überschreiben. Setzt voraus,
+// dass der Therapeutenname zwischen Alt- und Neu-Backup unverändert
+// geblieben ist - der einzige verfügbare Anhaltspunkt, da alte Backups
+// keine andere stabile Kennung besitzen.
+function migrateLegacyEntryToRealId(store, appData, therapistId) {
+  if (therapistId.startsWith("legacy-name-")) return;
+  if (store.therapists[therapistId]) return;
+
+  const therapistName = appData.settings?.therapistName || "";
+  const legacyKey = `legacy-name-${slugifyTherapistName(therapistName)}`;
+  const legacyEntry = store.therapists[legacyKey];
+  if (!legacyEntry) return;
+
+  store.therapists[therapistId] = { ...legacyEntry, therapistId };
+  delete store.therapists[legacyKey];
+}
+
 function mergeAppDataIntoStore(store, appData) {
   const therapistName = appData.settings?.therapistName || "Unbekannter Therapeut";
   const therapistId = resolveTherapistId(appData);
+  migrateLegacyEntryToRealId(store, appData, therapistId);
   const existing = store.therapists[therapistId] || { therapistId, therapistName, homes: [], aerzte: [], nachbestellHistory: [] };
 
   const existingHomesById = new Map((existing.homes || []).map((h) => [h.homeId, h]));
