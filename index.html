@@ -53,7 +53,7 @@
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div>
       <h1>FaSt-Doku Viewer</h1>
-      <p>Läuft lokal, ohne Internetverbindung. Lädt die Backup-ZIPs aus der FaSt-Doku App ein - sowohl aktuelle (PIN-geschützte) als auch ältere, mit dem damaligen Praxis-Passwort geschützte Dateien. Physiotherapie, Ergotherapie und Alt-Daten werden automatisch erkannt und getrennt angezeigt. Gespeicherte Daten sind bei jedem Öffnen zusätzlich mit einer PIN gesperrt.</p>
+      <p>Läuft lokal, ohne Internetverbindung. Lädt die Backup-ZIPs aus der FaSt-Doku App ein - sowohl aktuelle (PIN-geschützte) als auch ältere, mit dem damaligen Praxis-Passwort geschützte Dateien. Physiotherapie, Ergotherapie und Alt-Daten werden automatisch erkannt und getrennt angezeigt. Die hier im Browser gespeicherte Kopie der Daten ist mit einem selbst gewählten Speicher-PIN verschlüsselt - auch auf einem gemeinsam genutzten Rechner für andere nicht lesbar.</p>
     </div>
     <button id="hardRefreshBtn" class="secondary" style="flex-shrink:0; white-space:nowrap;">🔄 Aktualisieren</button>
   </div>
@@ -295,7 +295,66 @@ function resolveModuleInfo(appData, viaLegacyFormat) {
 // Therapeuten-Einträge aus unterschiedlichen Praxis-Bereichen sich sonst
 // gegenseitig überschreiben bzw. ihre Patientenlisten vermischen.
 // ============================================================
-const STORE_KEY = "fastdoku_viewer_store_v1";
+// Alter, unverschlüsselter Speicherort (bis einschließlich der Version mit
+// Physio/Ergo/Alt-Daten-Trennung) - wird nur noch für die einmalige
+// Migration auf den neuen, verschlüsselten Speicher gebraucht (siehe
+// hasLegacyPlaintextStore()/renderMigrateToEncryptedScreen() weiter unten).
+const LEGACY_PLAINTEXT_STORE_KEY = "fastdoku_viewer_store_v1";
+
+// ============================================================
+// Verschlüsselung des lokalen Speichers: auf einem gemeinsam genutzten
+// Rechner darf die im Browser abgelegte Kopie der Patientendaten nicht im
+// Klartext in localStorage liegen (dort wäre sie über die Entwicklertools
+// oder direkten Dateizugriff für jeden lesbar, der an den Rechner kommt).
+// Der Speicher-PIN hier ist bewusst ein ANDERES Geheimnis als das
+// PIN/Passwort-Feld beim Einlesen einer Backup-Datei weiter oben (das
+// entsperrt nur die ZIP, nicht den Browser-Speicher) - er wird beim ersten
+// Speichern frei vom Nutzer vergeben und existiert nur als Salt (für die
+// Schlüssel-Ableitung) und Chiffretext in localStorage, nie im Klartext.
+// Verwendet denselben PBKDF2(250000,SHA-256)+AES-GCM-256-Ansatz wie die
+// Haupt-App und der Alt-Backup-Pfad oben, bewusst eigenständig implementiert
+// (keine gemeinsamen Hilfsfunktionen), damit dieser Block für sich
+// nachvollziehbar bleibt.
+const STORAGE_CRYPTO_KEY = "fastdoku_viewer_crypto_v1";
+const STORE_CIPHER_KEY = "fastdoku_viewer_store_enc_v1";
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  bytes.forEach((b) => (binary += String.fromCharCode(b)));
+  return btoa(binary);
+}
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveStorageKey(pin, saltBytes) {
+  const keyMaterial = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: saltBytes, iterations: 250000, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+function hasEncryptedStore() {
+  return !!localStorage.getItem(STORAGE_CRYPTO_KEY) && !!localStorage.getItem(STORE_CIPHER_KEY);
+}
+
+// Nur für die einmalige Migration gebraucht: gab es vor der Verschlüsselung
+// schon unverschlüsselt gespeicherte Daten in diesem Browser?
+function hasLegacyPlaintextStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LEGACY_PLAINTEXT_STORE_KEY) || "null");
+    return !!(parsed && parsed.therapists && Object.keys(parsed.therapists).length > 0);
+  } catch {
+    return false;
+  }
+}
 
 function buildTherapistStoreKey(moduleKey, therapistId) {
   return `${moduleKey}::${therapistId}`;
@@ -326,23 +385,33 @@ function migrateFlatStoreToModuleKeyed(store) {
   return changed;
 }
 
-function loadStore() {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    const parsed = raw ? JSON.parse(raw) : { therapists: {} };
-    // Migration sofort zurückschreiben, statt nur im Arbeitsspeicher zu
-    // halten - sonst bliebe der alte, flache Schlüssel in localStorage
-    // liegen, bis zufällig die nächste Änderung (Import/Löschen) speichert.
-    if (migrateFlatStoreToModuleKeyed(parsed)) {
-      localStorage.setItem(STORE_KEY, JSON.stringify(parsed));
-    }
-    return parsed;
-  } catch {
-    return { therapists: {} };
-  }
+// storageKey: der aus dem Speicher-PIN abgeleitete AES-GCM-Schlüssel - wie
+// der Unlock-Status (siehe isUnlocked weiter unten) bewusst NUR im
+// Arbeitsspeicher gehalten, nie selbst gespeichert.
+let storageKey = null;
+
+async function saveStore(storeObj) {
+  if (!storageKey) return; // sollte durch die Aufrufer-Logik nie passieren
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plainBytes = new TextEncoder().encode(JSON.stringify(storeObj));
+  const cipherBytes = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, storageKey, plainBytes));
+  localStorage.setItem(STORE_CIPHER_KEY, JSON.stringify({ ivBase64: bytesToBase64(iv), cipherBase64: bytesToBase64(cipherBytes) }));
 }
-function saveStore(store) {
-  localStorage.setItem(STORE_KEY, JSON.stringify(store));
+
+// Entschlüsselt den gespeicherten Stand mit dem übergebenen Schlüssel -
+// schlägt (durch den AES-GCM-Authentifizierungstag) automatisch fehl, wenn
+// der Speicher-PIN falsch war. Das ist zugleich die PIN-Prüfung selbst, es
+// gibt bewusst keinen separaten Vergleichswert dafür.
+async function decryptStore(candidateKey) {
+  const raw = localStorage.getItem(STORE_CIPHER_KEY);
+  if (!raw) return { therapists: {} };
+  const { ivBase64, cipherBase64 } = JSON.parse(raw);
+  const plainBuffer = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64ToBytes(ivBase64) },
+    candidateKey,
+    base64ToBytes(cipherBase64)
+  );
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(plainBuffer)));
 }
 
 // Ältere Backups (vor Einführung von settings.therapistId in der Haupt-App)
@@ -473,36 +542,43 @@ function mergeAppDataIntoStore(store, appData, moduleInfo) {
 // Daten (localStorage, aus zuvor eingespielten Backup-ZIPs) sind ohne
 // diese Sperre für jeden lesbar, der das Gerät/den Browser öffnet -
 // unabhängig von der ZIP-eigenen PIN-Abfrage beim Einspielen einer
-// neuen Datei. Der Unlock-Status wird bewusst NICHT gespeichert
-// (nur im Arbeitsspeicher), damit bei jedem erneuten Öffnen der Seite
-// wieder die PIN verlangt wird.
+// neuen Datei. Entsperren bedeutet jetzt (anders als die frühere, feste
+// PIN "1550") eine ECHTE Entschlüsselung des Speichers mit dem selbst
+// vergebenen Speicher-PIN (siehe storageKey/decryptStore() oben) - eine
+// falsche Eingabe liefert keinen lesbaren Stand, nicht nur eine verweigerte
+// Anzeige. Der Unlock-Status wird bewusst NICHT gespeichert (nur im
+// Arbeitsspeicher), damit bei jedem erneuten Öffnen der Seite wieder der
+// PIN verlangt wird.
 // ============================================================
-const APP_UNLOCK_PIN = "1550";
 let isUnlocked = false;
-
-function hasAnyStoredData() {
-  return Object.keys(store.therapists || {}).length > 0;
-}
 
 function renderLockScreen() {
   app.innerHTML = `
     <div class="card">
       <h2>Gesperrt</h2>
-      <p class="muted">Zum Schutz der gespeicherten Patientendaten bitte die PIN eingeben.</p>
-      <label for="unlockPinInput">PIN</label>
-      <input id="unlockPinInput" type="password" inputmode="numeric" autocomplete="off">
+      <p class="muted">Zum Schutz der gespeicherten Patientendaten bitte den Speicher-PIN eingeben.</p>
+      <label for="unlockPinInput">Speicher-PIN</label>
+      <input id="unlockPinInput" type="password" autocomplete="off">
       <div class="row"><button id="unlockBtn">Entsperren</button></div>
       <div id="unlockMsg" class="error"></div>
     </div>
   `;
 
-  const tryUnlock = () => {
+  const tryUnlock = async () => {
     const pin = document.getElementById("unlockPinInput").value;
-    if (pin === APP_UNLOCK_PIN) {
+    const unlockMsg = document.getElementById("unlockMsg");
+    unlockMsg.textContent = "";
+    try {
+      const cryptoRecord = JSON.parse(localStorage.getItem(STORAGE_CRYPTO_KEY) || "null");
+      if (!cryptoRecord?.saltBase64) throw new Error("Kein Speicher-PIN eingerichtet.");
+      const candidateKey = await deriveStorageKey(pin, base64ToBytes(cryptoRecord.saltBase64));
+      const decrypted = await decryptStore(candidateKey);
+      storageKey = candidateKey;
+      store = decrypted;
       isUnlocked = true;
       renderGate();
-    } else {
-      document.getElementById("unlockMsg").textContent = "Falsche PIN.";
+    } catch {
+      unlockMsg.textContent = "Falsche PIN.";
     }
   };
 
@@ -513,9 +589,61 @@ function renderLockScreen() {
   document.getElementById("unlockPinInput").focus();
 }
 
+// Einmaliger Übergang für Browser, in denen schon (unverschlüsselt)
+// gespeicherte Daten aus einer Viewer-Version vor Einführung der
+// Verschlüsselung liegen (siehe LEGACY_PLAINTEXT_STORE_KEY oben) - verlangt
+// sofort einen neuen Speicher-PIN, verschlüsselt den vorhandenen Stand
+// damit und entfernt danach den alten Klartext-Eintrag.
+function renderMigrateToEncryptedScreen() {
+  app.innerHTML = `
+    <div class="card">
+      <h2>Speicher-PIN einrichten</h2>
+      <p class="muted">In diesem Browser liegen bereits gespeicherte Patientendaten unverschlüsselt vor. Bitte jetzt einen Speicher-PIN vergeben, um sie zu schützen - danach sind sie nur noch mit diesem PIN lesbar.</p>
+      <label for="migratePinInput">Neuer Speicher-PIN (mind. 4 Zeichen)</label>
+      <input id="migratePinInput" type="password" autocomplete="off">
+      <label for="migratePinRepeatInput">Speicher-PIN wiederholen</label>
+      <input id="migratePinRepeatInput" type="password" autocomplete="off">
+      <div class="row"><button id="migrateBtn">Daten jetzt verschlüsseln</button></div>
+      <div id="migrateMsg" class="error"></div>
+    </div>
+  `;
+
+  document.getElementById("migrateBtn").onclick = async () => {
+    const pin = document.getElementById("migratePinInput").value;
+    const repeat = document.getElementById("migratePinRepeatInput").value;
+    const msg = document.getElementById("migrateMsg");
+    msg.textContent = "";
+    if (!pin || pin.length < 4) { msg.textContent = "Bitte mindestens 4 Zeichen eingeben."; return; }
+    if (pin !== repeat) { msg.textContent = "Die beiden Eingaben stimmen nicht überein."; return; }
+
+    let parsedOld;
+    try {
+      parsedOld = JSON.parse(localStorage.getItem(LEGACY_PLAINTEXT_STORE_KEY) || "null") || { therapists: {} };
+    } catch {
+      parsedOld = { therapists: {} };
+    }
+    migrateFlatStoreToModuleKeyed(parsedOld);
+
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    localStorage.setItem(STORAGE_CRYPTO_KEY, JSON.stringify({ saltBase64: bytesToBase64(salt) }));
+    storageKey = await deriveStorageKey(pin, salt);
+    store = parsedOld;
+    await saveStore(store);
+    localStorage.removeItem(LEGACY_PLAINTEXT_STORE_KEY);
+    isUnlocked = true;
+    render();
+  };
+}
+
 function renderGate() {
-  if (hasAnyStoredData() && !isUnlocked) {
-    renderLockScreen();
+  if (hasEncryptedStore()) {
+    if (!isUnlocked) {
+      renderLockScreen();
+    } else {
+      render();
+    }
+  } else if (hasLegacyPlaintextStore()) {
+    renderMigrateToEncryptedScreen();
   } else {
     render();
   }
@@ -525,7 +653,7 @@ function renderGate() {
 // UI
 // ============================================================
 const app = document.getElementById("app");
-let store = loadStore();
+let store = { therapists: {} }; // wird erst durch renderLockScreen()/renderMigrateToEncryptedScreen() bzw. den ersten Import befüllt
 let uiState = {
   expandedTherapist: null,
   activeTab: {},
@@ -1617,14 +1745,21 @@ function renderModuleSections(therapists) {
 function render() {
   const therapists = Object.values(store.therapists || {}).sort((a, b) => a.therapistName.localeCompare(b.therapistName, "de"));
 
+  const needsNewStoragePin = storageKey === null && !hasEncryptedStore();
+
   app.innerHTML = `
     <div class="card">
       <h2>Export-Datei laden</h2>
       <label for="fileInput">Export-ZIP (.zip)</label>
       <input id="fileInput" type="file" accept=".zip">
-      <label for="pinInput">PIN / Passwort</label>
+      <label for="pinInput">PIN / Passwort der Datei</label>
       <input id="pinInput" type="password" autocomplete="off">
       <p class="muted" style="margin-top:4px;">Bei aktuellen Backups die feste PIN <b>1550</b> eingeben. Bei älteren Backups (vor Einführung dieser PIN) stattdessen das damalige Praxis-Passwort. Physiotherapie, Ergotherapie und Alt-Daten werden automatisch erkannt.</p>
+      ${needsNewStoragePin ? `
+        <label for="storagePinInput">Speicher-PIN festlegen (schützt die hier im Browser gespeicherten Daten)</label>
+        <input id="storagePinInput" type="password" autocomplete="off">
+        <p class="muted" style="margin-top:4px;">Frei wählbar, mindestens 4 Zeichen, unabhängig vom PIN/Passwort oben. Bitte merken - ohne diesen Speicher-PIN sind die hier gespeicherten Daten später nicht mehr lesbar.</p>
+      ` : ""}
       <div class="row">
         <button id="loadBtn">Datei laden</button>
       </div>
@@ -1659,11 +1794,26 @@ function bindEvents(therapists) {
       return;
     }
 
+    // Beim allerersten Speichern in diesem Browser gibt es noch keinen
+    // Speicher-PIN - das zugehörige Feld wird nur dann angezeigt (siehe
+    // render()), muss also auch nur dann ausgefüllt sein.
+    if (storageKey === null) {
+      const storagePinInput = document.getElementById("storagePinInput");
+      const newStoragePin = storagePinInput ? storagePinInput.value : "";
+      if (!newStoragePin || newStoragePin.length < 4) {
+        msg.textContent = "Bitte zuerst einen Speicher-PIN mit mindestens 4 Zeichen vergeben.";
+        return;
+      }
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      localStorage.setItem(STORAGE_CRYPTO_KEY, JSON.stringify({ saltBase64: bytesToBase64(salt) }));
+      storageKey = await deriveStorageKey(newStoragePin, salt);
+    }
+
     try {
       const { appData, viaLegacyFormat } = await readExportFile(file, secret);
       const moduleInfo = resolveModuleInfo(appData, viaLegacyFormat);
       store = mergeAppDataIntoStore(store, appData, moduleInfo);
-      saveStore(store);
+      await saveStore(store);
       uiState.expandedTherapist = buildTherapistStoreKey(moduleInfo.moduleKey, resolveTherapistId(appData));
       msg.className = "muted";
       msg.textContent = `Datei erfolgreich geladen und abgeglichen (${moduleInfo.moduleLabel}).`;
@@ -1702,14 +1852,14 @@ function bindBodyEvents(therapist) {
 
   const deleteBtn = body.querySelector(".deleteTherapistBtn");
   if (deleteBtn) {
-    deleteBtn.onclick = () => {
+    deleteBtn.onclick = async () => {
       const confirmed = confirm(
         `Alle im Viewer gespeicherten Daten von "${therapist.therapistName}" (${therapist.moduleLabel}) wirklich löschen?\n\n` +
         `Das betrifft nur diese lokale Browser-Kopie, nicht die App selbst - kann jederzeit durch erneutes Einspielen einer Backup-Datei wiederhergestellt werden.`
       );
       if (!confirmed) return;
       delete store.therapists[therapist.storeKey];
-      saveStore(store);
+      await saveStore(store);
       if (uiState.expandedTherapist === therapist.storeKey) uiState.expandedTherapist = null;
       render();
     };
