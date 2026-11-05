@@ -53,7 +53,7 @@
   <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
     <div>
       <h1>FaSt-Doku Viewer</h1>
-      <p>Läuft lokal, ohne Internetverbindung. Lädt die Backup-ZIPs aus der FaSt-Doku App ein - sowohl aktuelle (PIN-geschützte) als auch ältere, mit dem damaligen Praxis-Passwort geschützte Dateien. Gespeicherte Daten sind bei jedem Öffnen zusätzlich mit einer PIN gesperrt.</p>
+      <p>Läuft lokal, ohne Internetverbindung. Lädt die Backup-ZIPs aus der FaSt-Doku App ein - sowohl aktuelle (PIN-geschützte) als auch ältere, mit dem damaligen Praxis-Passwort geschützte Dateien. Physiotherapie, Ergotherapie und Alt-Daten werden automatisch erkannt und getrennt angezeigt. Gespeicherte Daten sind bei jedem Öffnen zusätzlich mit einer PIN gesperrt.</p>
     </div>
     <button id="hardRefreshBtn" class="secondary" style="flex-shrink:0; white-space:nowrap;">🔄 Aktualisieren</button>
   </div>
@@ -162,6 +162,11 @@ async function decryptLegacyAppData(entries, zipLib, secret) {
   }
 }
 
+// viaLegacyFormat sagt, über welchen der beiden oben beschriebenen Wege die
+// Datei gelesen wurde - wird von resolveModuleInfo() unten gebraucht, um
+// Alt-Backups (ganz altes App-Format, von vor der Praxis-Umstellung) sicher
+// von aktuellen Backups zu unterscheiden, selbst wenn beide zufällig
+// dasselbe appData.module tragen (siehe Kommentar dort).
 async function readExportFile(file, secret) {
   const zipLib = window.zip;
   if (!zipLib) throw new Error("ZIP-Bibliothek nicht geladen.");
@@ -178,12 +183,12 @@ async function readExportFile(file, secret) {
       } catch {
         throw new Error("Falsche PIN oder beschädigte Datei.");
       }
-      return { appData };
+      return { appData, viaLegacyFormat: false };
     }
 
     const legacyAppData = await decryptLegacyAppData(entries, zipLib, secret);
     if (legacyAppData) {
-      return { appData: legacyAppData };
+      return { appData: legacyAppData, viaLegacyFormat: true };
     }
 
     throw new Error("Datei ist keine gültige FaSt-Doku Viewer-Exportdatei.");
@@ -249,16 +254,89 @@ function getRezeptFristSummary(rezept) {
 }
 
 // ============================================================
+// Modul-Erkennung (Physiotherapie / Ergotherapie / Alt-Daten): die FaSt-Doku
+// App gibt es inzwischen in mehreren eigenständigen Varianten mit jeweils
+// eigenem appData.module ("doku" für Physio, "ergo" für Ergo). Die ganz alte
+// App-Generation (vor der appData.json-/PIN-Umstellung, siehe
+// readExportFile()/decryptLegacyAppData() oben) kennt appData.module gar
+// nicht zuverlässig und trägt dort ohnehin "doku" wie die aktuelle
+// Physio-App - ein reiner Vergleich von appData.module allein würde ihre
+// Alt-Daten deshalb fälschlich mit aktuellen Physio-Daten zusammenwerfen.
+// Deshalb zählt viaLegacyFormat (stammt die Datei aus dem alten
+// appData.enc+cryptoMeta.json-Format?) IMMER zuerst: jeder so gelesene
+// Import gilt als "Alt-Daten", unabhängig vom module-Feld.
+const MODULE_CATEGORIES = [
+  { key: "physio", label: "Physiotherapie" },
+  { key: "ergo", label: "Ergotherapie" },
+  { key: "legacy", label: "Alt-Daten (vor der App-Umstellung)" }
+];
+
+function resolveModuleInfo(appData, viaLegacyFormat) {
+  if (viaLegacyFormat) {
+    return { moduleKey: "legacy", moduleLabel: "Alt-Daten (vor der App-Umstellung)" };
+  }
+  if (String(appData?.module || "").trim().toLowerCase() === "ergo") {
+    return { moduleKey: "ergo", moduleLabel: "Ergotherapie" };
+  }
+  return { moduleKey: "physio", moduleLabel: "Physiotherapie" };
+}
+
+// ============================================================
 // Lokaler Speicher (Abgleich-Logik: neuere Exporte überschreiben
 // ältere Einträge, keine Duplikate, gelöschte Patienten werden
 // als inaktiv markiert statt gelöscht)
+//
+// Jeder Therapeut wird unter einem aus Modul UND therapistId
+// zusammengesetzten Schlüssel gespeichert (siehe buildTherapistStoreKey()),
+// NICHT mehr unter der therapistId allein. Grund: dieselbe Person kann in
+// Physiotherapie und Ergotherapie parallel dieselben Patienten behandeln -
+// ohne die Modul-Trennung im Schlüssel selbst könnten gleich benannte oder
+// (im alten, ID-losen Backup-Format) über denselben Namen gefundene
+// Therapeuten-Einträge aus unterschiedlichen Praxis-Bereichen sich sonst
+// gegenseitig überschreiben bzw. ihre Patientenlisten vermischen.
 // ============================================================
 const STORE_KEY = "fastdoku_viewer_store_v1";
+
+function buildTherapistStoreKey(moduleKey, therapistId) {
+  return `${moduleKey}::${therapistId}`;
+}
+
+// Daten aus einer früheren Viewer-Version (vor Einführung der Modul-
+// Trennung) lagen noch flach unter der reinen therapistId. Diese Version
+// kannte ausschließlich das aktuelle Physio-Backup-Format, deshalb werden
+// solche Alt-Einträge einmalig als "physio" eingeordnet statt verworfen.
+function migrateFlatStoreToModuleKeyed(store) {
+  const therapists = store.therapists || {};
+  let changed = false;
+
+  Object.keys(therapists).forEach((key) => {
+    const entry = therapists[key];
+    if (!entry || entry.moduleKey) return; // bereits modul-verschlüsselt
+
+    changed = true;
+    const moduleKey = "physio";
+    const moduleLabel = "Physiotherapie";
+    const therapistId = entry.therapistId || key;
+    const storeKey = buildTherapistStoreKey(moduleKey, therapistId);
+    delete therapists[key];
+    therapists[storeKey] = { ...entry, moduleKey, moduleLabel, therapistId, storeKey };
+  });
+
+  if (changed) store.therapists = therapists;
+  return changed;
+}
 
 function loadStore() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    return raw ? JSON.parse(raw) : { therapists: {} };
+    const parsed = raw ? JSON.parse(raw) : { therapists: {} };
+    // Migration sofort zurückschreiben, statt nur im Arbeitsspeicher zu
+    // halten - sonst bliebe der alte, flache Schlüssel in localStorage
+    // liegen, bis zufällig die nächste Änderung (Import/Löschen) speichert.
+    if (migrateFlatStoreToModuleKeyed(parsed)) {
+      localStorage.setItem(STORE_KEY, JSON.stringify(parsed));
+    }
+    return parsed;
   } catch {
     return { therapists: {} };
   }
@@ -303,31 +381,36 @@ function resolveTherapistId(appData) {
 // Koch" zweimal), statt dass die bisherige Historie weitergeführt wird.
 // Wird deshalb einmalig ausgeführt, sobald eine noch unbekannte ECHTE
 // therapistId auftaucht: existiert dafür bereits ein namensgleicher
-// Alt-Eintrag, wird dessen komplette bisherige Historie unter dem neuen,
-// echten Schlüssel weitergeführt (nicht kopiert - der alte Schlüssel wird
-// dabei entfernt), sodass die anschließende normale Merge-Logik die neuen
-// Daten ganz regulär dazu ergänzt statt zu überschreiben. Setzt voraus,
-// dass der Therapeutenname zwischen Alt- und Neu-Backup unverändert
-// geblieben ist - der einzige verfügbare Anhaltspunkt, da alte Backups
-// keine andere stabile Kennung besitzen.
-function migrateLegacyEntryToRealId(store, appData, therapistId) {
+// Alt-Eintrag IM SELBEN MODUL (Physio-Alt-Daten dürfen z.B. nie mit einem
+// Ergo-Eintrag gleichen Namens verschmelzen), wird dessen komplette
+// bisherige Historie unter dem neuen, echten Schlüssel weitergeführt (nicht
+// kopiert - der alte Schlüssel wird dabei entfernt), sodass die
+// anschließende normale Merge-Logik die neuen Daten ganz regulär dazu
+// ergänzt statt zu überschreiben. Setzt voraus, dass der Therapeutenname
+// zwischen Alt- und Neu-Backup unverändert geblieben ist - der einzige
+// verfügbare Anhaltspunkt, da alte Backups keine andere stabile Kennung
+// besitzen.
+function migrateLegacyEntryToRealId(store, appData, therapistId, moduleKey) {
   if (therapistId.startsWith("legacy-name-")) return;
-  if (store.therapists[therapistId]) return;
+  const storeKey = buildTherapistStoreKey(moduleKey, therapistId);
+  if (store.therapists[storeKey]) return;
 
   const therapistName = appData.settings?.therapistName || "";
-  const legacyKey = `legacy-name-${slugifyTherapistName(therapistName)}`;
+  const legacyKey = buildTherapistStoreKey(moduleKey, `legacy-name-${slugifyTherapistName(therapistName)}`);
   const legacyEntry = store.therapists[legacyKey];
   if (!legacyEntry) return;
 
-  store.therapists[therapistId] = { ...legacyEntry, therapistId };
+  store.therapists[storeKey] = { ...legacyEntry, therapistId, storeKey };
   delete store.therapists[legacyKey];
 }
 
-function mergeAppDataIntoStore(store, appData) {
+function mergeAppDataIntoStore(store, appData, moduleInfo) {
+  const { moduleKey, moduleLabel } = moduleInfo;
   const therapistName = appData.settings?.therapistName || "Unbekannter Therapeut";
   const therapistId = resolveTherapistId(appData);
-  migrateLegacyEntryToRealId(store, appData, therapistId);
-  const existing = store.therapists[therapistId] || { therapistId, therapistName, homes: [], aerzte: [], nachbestellHistory: [] };
+  migrateLegacyEntryToRealId(store, appData, therapistId, moduleKey);
+  const storeKey = buildTherapistStoreKey(moduleKey, therapistId);
+  const existing = store.therapists[storeKey] || { therapistId, therapistName, moduleKey, moduleLabel, storeKey, homes: [], aerzte: [], nachbestellHistory: [] };
 
   const existingHomesById = new Map((existing.homes || []).map((h) => [h.homeId, h]));
   const newHomeIds = new Set((appData.homes || []).map((h) => h.homeId));
@@ -359,9 +442,12 @@ function mergeAppDataIntoStore(store, appData) {
   const prevSettings = existing.settings || {};
   const newSettings = appData.settings || {};
 
-  store.therapists[therapistId] = {
+  store.therapists[storeKey] = {
     therapistId,
     therapistName,
+    moduleKey,
+    moduleLabel,
+    storeKey,
     homes: mergedHomes,
     aerzte: appData.aerzte && appData.aerzte.length ? appData.aerzte : (existing.aerzte || []),
     nachbestellHistory: appData.nachbestellHistory && appData.nachbestellHistory.length ? appData.nachbestellHistory : (existing.nachbestellHistory || []),
@@ -958,8 +1044,8 @@ function renderPatientSummaryLine(patient) {
 // und Patienten als eigenständige, unabhängig aufklappbare Accordions
 // (statt Klick-Auswahl mit Detail-Panel unterhalb der gesamten Liste).
 function renderPatientenHomeGrouped(therapist, homes, search) {
-  const openHomes = getStateSet(uiState.openHomes, therapist.therapistId);
-  const openPatients = getStateSet(uiState.openPatients, therapist.therapistId);
+  const openHomes = getStateSet(uiState.openHomes, therapist.storeKey);
+  const openPatients = getStateSet(uiState.openPatients, therapist.storeKey);
 
   const filteredHomes = (homes || []).map((home) => {
     const patients = [...(home.patients || [])]
@@ -1006,7 +1092,7 @@ function renderPatientenHomeGrouped(therapist, homes, search) {
 // aller Patienten über alle Einrichtungen hinweg, ebenfalls als aufklappbare
 // Accordions statt Klick-Auswahl.
 function renderPatientenAlpha(therapist, rows) {
-  const openPatients = getStateSet(uiState.openPatients, therapist.therapistId);
+  const openPatients = getStateSet(uiState.openPatients, therapist.storeKey);
   if (rows.length === 0) return '<p class="muted">Keine Patienten gefunden.</p>';
 
   return rows.map(({ home, patient }) => {
@@ -1026,7 +1112,7 @@ function renderPatientenAlpha(therapist, rows) {
 // Reiter "Ärzte": ebenfalls Accordions statt Klick-Auswahl mit Detail-Panel
 // unterhalb der Liste.
 function renderAerzteTab(therapist, doctors, search) {
-  const openArzt = getStateSet(uiState.openArzt, therapist.therapistId);
+  const openArzt = getStateSet(uiState.openArzt, therapist.storeKey);
   const filtered = search ? doctors.filter((d) => d.name.toLowerCase().includes(search)) : doctors;
   if (filtered.length === 0) return '<p class="muted">Keine Ärzte gefunden.</p>';
 
@@ -1057,7 +1143,7 @@ function renderBefreiungenTab(therapist) {
   const rows = getBefreitePatientsForTherapist(therapist);
   if (rows.length === 0) return '<p class="muted">Keine als zuzahlungsbefreit markierten Patienten.</p>';
 
-  const openPatients = getStateSet(uiState.openPatients, therapist.therapistId);
+  const openPatients = getStateSet(uiState.openPatients, therapist.storeKey);
   return rows.map(({ home, patient }) => {
     const isOpen = openPatients.has(patient.patientId);
     return `
@@ -1076,7 +1162,7 @@ function renderBefreiungenTab(therapist) {
 // Zeitraum tatsächlich geloggten Patienten-Zeiten sowie der Stundensaldo
 // (analog zur "Stundenkonto"-Funktion der Haupt-App).
 function renderStundenTab(therapist) {
-  const tid = therapist.therapistId;
+  const tid = therapist.storeKey;
   const mode = uiState.stundenMode[tid] || "tag";
   const todayDe = formatDeDate(getComparableFromDate(new Date()));
   const singleDate = uiState.stundenDate[tid] || todayDe;
@@ -1396,7 +1482,7 @@ function openViewerPrintWindow(therapist, title, subtitle, bodyHtml, count) {
 }
 
 function renderDruckenTab(therapist) {
-  const tid = therapist.therapistId;
+  const tid = therapist.storeKey;
   const bereich = uiState.druckenBereich[tid] || DRUCKEN_BEREICHE[0].val;
   const mode = uiState.druckenMode[tid] || "gesamt";
   const todayDe = formatDeDate(getComparableFromDate(new Date()));
@@ -1431,7 +1517,7 @@ function renderDruckenTab(therapist) {
 }
 
 function renderTherapistBody(therapist) {
-  const tid = therapist.therapistId;
+  const tid = therapist.storeKey;
   const tab = uiState.activeTab[tid] || "patienten";
   const search = (uiState.searchText[tid] || "").trim().toLowerCase();
   const hasSearch = tab === "patienten" || tab === "aerzte";
@@ -1498,6 +1584,36 @@ function renderTherapistBody(therapist) {
   `;
 }
 
+function renderTherapistAccordion(therapist) {
+  return `
+    <details class="accordion" ${uiState.expandedTherapist === therapist.storeKey ? "open" : ""} data-therapist-toggle="${esc(therapist.storeKey)}">
+      <summary>
+        <span>${esc(therapist.therapistName)}</span>
+        <span class="muted">${(therapist.homes || []).reduce((sum, h) => sum + (h.patients || []).length, 0)} Patient(en) · zuletzt geladen: ${esc(formatDeDate(therapist.lastImportAt?.slice(0, 10)) || "—")}</span>
+      </summary>
+      <div class="accordion-body" id="therapist-body-${esc(therapist.storeKey)}">
+        ${uiState.expandedTherapist === therapist.storeKey ? renderTherapistBody(therapist) : ""}
+      </div>
+    </details>
+  `;
+}
+
+// Gruppiert die geladenen Therapeuten nach Modul (siehe MODULE_CATEGORIES/
+// resolveModuleInfo() oben) in eigene, klar beschriftete Abschnitte -
+// Physiotherapie, Ergotherapie und Alt-Daten bleiben dadurch auch optisch
+// getrennt, selbst wenn Namen oder Patienten sich zwischen den Bereichen
+// überschneiden. Ein Abschnitt ohne Einträge wird nicht angezeigt.
+function renderModuleSections(therapists) {
+  return MODULE_CATEGORIES.map(({ key, label }) => {
+    const group = therapists.filter((t) => t.moduleKey === key);
+    if (group.length === 0) return "";
+    return `
+      <h2 style="margin:28px 0 10px; font-size:17px;">${esc(label)}</h2>
+      ${group.map(renderTherapistAccordion).join("")}
+    `;
+  }).join("");
+}
+
 function render() {
   const therapists = Object.values(store.therapists || {}).sort((a, b) => a.therapistName.localeCompare(b.therapistName, "de"));
 
@@ -1508,7 +1624,7 @@ function render() {
       <input id="fileInput" type="file" accept=".zip">
       <label for="pinInput">PIN / Passwort</label>
       <input id="pinInput" type="password" autocomplete="off">
-      <p class="muted" style="margin-top:4px;">Bei aktuellen Backups die feste PIN <b>1550</b> eingeben. Bei älteren Backups (vor Einführung dieser PIN) stattdessen das damalige Praxis-Passwort.</p>
+      <p class="muted" style="margin-top:4px;">Bei aktuellen Backups die feste PIN <b>1550</b> eingeben. Bei älteren Backups (vor Einführung dieser PIN) stattdessen das damalige Praxis-Passwort. Physiotherapie, Ergotherapie und Alt-Daten werden automatisch erkannt.</p>
       <div class="row">
         <button id="loadBtn">Datei laden</button>
       </div>
@@ -1517,17 +1633,7 @@ function render() {
 
     ${therapists.length === 0 ? `
       <div class="card"><p class="muted">Noch keine Daten geladen. Bitte eine Export-Datei auswählen.</p></div>
-    ` : therapists.map((therapist) => `
-      <details class="accordion" ${uiState.expandedTherapist === therapist.therapistId ? "open" : ""} data-therapist-toggle="${esc(therapist.therapistId)}">
-        <summary>
-          <span>${esc(therapist.therapistName)}</span>
-          <span class="muted">${(therapist.homes || []).reduce((sum, h) => sum + (h.patients || []).length, 0)} Patient(en) · zuletzt geladen: ${esc(formatDeDate(therapist.lastImportAt?.slice(0, 10)) || "—")}</span>
-        </summary>
-        <div class="accordion-body" id="therapist-body-${esc(therapist.therapistId)}">
-          ${uiState.expandedTherapist === therapist.therapistId ? renderTherapistBody(therapist) : ""}
-        </div>
-      </details>
-    `).join("")}
+    ` : renderModuleSections(therapists)}
   `;
 
   bindEvents(therapists);
@@ -1554,12 +1660,13 @@ function bindEvents(therapists) {
     }
 
     try {
-      const { appData } = await readExportFile(file, secret);
-      store = mergeAppDataIntoStore(store, appData);
+      const { appData, viaLegacyFormat } = await readExportFile(file, secret);
+      const moduleInfo = resolveModuleInfo(appData, viaLegacyFormat);
+      store = mergeAppDataIntoStore(store, appData, moduleInfo);
       saveStore(store);
-      uiState.expandedTherapist = resolveTherapistId(appData);
+      uiState.expandedTherapist = buildTherapistStoreKey(moduleInfo.moduleKey, resolveTherapistId(appData));
       msg.className = "muted";
-      msg.textContent = "Datei erfolgreich geladen und abgeglichen.";
+      msg.textContent = `Datei erfolgreich geladen und abgeglichen (${moduleInfo.moduleLabel}).`;
       render();
     } catch (err) {
       console.error(err);
@@ -1572,7 +1679,7 @@ function bindEvents(therapists) {
       if (el.open) {
         uiState.expandedTherapist = el.dataset.therapistToggle;
         const body = document.getElementById(`therapist-body-${el.dataset.therapistToggle}`);
-        const therapist = therapists.find((t) => t.therapistId === el.dataset.therapistToggle);
+        const therapist = therapists.find((t) => t.storeKey === el.dataset.therapistToggle);
         if (body && therapist) {
           body.innerHTML = renderTherapistBody(therapist);
           bindBodyEvents(therapist);
@@ -1584,33 +1691,33 @@ function bindEvents(therapists) {
   });
 
   if (uiState.expandedTherapist) {
-    const therapist = therapists.find((t) => t.therapistId === uiState.expandedTherapist);
+    const therapist = therapists.find((t) => t.storeKey === uiState.expandedTherapist);
     if (therapist) bindBodyEvents(therapist);
   }
 }
 
 function bindBodyEvents(therapist) {
-  const body = document.getElementById(`therapist-body-${therapist.therapistId}`);
+  const body = document.getElementById(`therapist-body-${therapist.storeKey}`);
   if (!body) return;
 
   const deleteBtn = body.querySelector(".deleteTherapistBtn");
   if (deleteBtn) {
     deleteBtn.onclick = () => {
       const confirmed = confirm(
-        `Alle im Viewer gespeicherten Daten von "${therapist.therapistName}" wirklich löschen?\n\n` +
+        `Alle im Viewer gespeicherten Daten von "${therapist.therapistName}" (${therapist.moduleLabel}) wirklich löschen?\n\n` +
         `Das betrifft nur diese lokale Browser-Kopie, nicht die App selbst - kann jederzeit durch erneutes Einspielen einer Backup-Datei wiederhergestellt werden.`
       );
       if (!confirmed) return;
-      delete store.therapists[therapist.therapistId];
+      delete store.therapists[therapist.storeKey];
       saveStore(store);
-      if (uiState.expandedTherapist === therapist.therapistId) uiState.expandedTherapist = null;
+      if (uiState.expandedTherapist === therapist.storeKey) uiState.expandedTherapist = null;
       render();
     };
   }
 
   body.querySelectorAll(".tabBtn").forEach((btn) => {
     btn.onclick = () => {
-      uiState.activeTab[therapist.therapistId] = btn.dataset.tab;
+      uiState.activeTab[therapist.storeKey] = btn.dataset.tab;
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     };
@@ -1619,7 +1726,7 @@ function bindBodyEvents(therapist) {
   const searchInput = body.querySelector(".searchInput");
   if (searchInput) {
     searchInput.oninput = () => {
-      uiState.searchText[therapist.therapistId] = searchInput.value;
+      uiState.searchText[therapist.storeKey] = searchInput.value;
       const focusPos = searchInput.selectionStart;
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
@@ -1633,7 +1740,7 @@ function bindBodyEvents(therapist) {
 
   body.querySelectorAll(".groupModeBtn").forEach((btn) => {
     btn.onclick = () => {
-      uiState.groupMode[therapist.therapistId] = btn.dataset.mode;
+      uiState.groupMode[therapist.storeKey] = btn.dataset.mode;
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     };
@@ -1646,26 +1753,26 @@ function bindBodyEvents(therapist) {
   // vollständig vorhanden (kein Nachladen nötig).
   body.querySelectorAll("details[data-home-id]").forEach((el) => {
     el.addEventListener("toggle", () => {
-      const set = getStateSet(uiState.openHomes, therapist.therapistId);
+      const set = getStateSet(uiState.openHomes, therapist.storeKey);
       if (el.open) set.add(el.dataset.homeId); else set.delete(el.dataset.homeId);
     });
   });
   body.querySelectorAll("details[data-patient-id]").forEach((el) => {
     el.addEventListener("toggle", () => {
-      const set = getStateSet(uiState.openPatients, therapist.therapistId);
+      const set = getStateSet(uiState.openPatients, therapist.storeKey);
       if (el.open) set.add(el.dataset.patientId); else set.delete(el.dataset.patientId);
     });
   });
   body.querySelectorAll("details[data-arzt-name]").forEach((el) => {
     el.addEventListener("toggle", () => {
-      const set = getStateSet(uiState.openArzt, therapist.therapistId);
+      const set = getStateSet(uiState.openArzt, therapist.storeKey);
       if (el.open) set.add(el.dataset.arztName); else set.delete(el.dataset.arztName);
     });
   });
 
   body.querySelectorAll(".stundenModeBtn").forEach((btn) => {
     btn.onclick = () => {
-      uiState.stundenMode[therapist.therapistId] = btn.dataset.mode;
+      uiState.stundenMode[therapist.storeKey] = btn.dataset.mode;
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     };
@@ -1675,7 +1782,7 @@ function bindBodyEvents(therapist) {
   if (stundenDateInput) {
     bindDeDateAutoFormat(stundenDateInput);
     stundenDateInput.addEventListener("change", () => {
-      uiState.stundenDate[therapist.therapistId] = stundenDateInput.value.trim();
+      uiState.stundenDate[therapist.storeKey] = stundenDateInput.value.trim();
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     });
@@ -1684,7 +1791,7 @@ function bindBodyEvents(therapist) {
   if (stundenFromInput) {
     bindDeDateAutoFormat(stundenFromInput);
     stundenFromInput.addEventListener("change", () => {
-      uiState.stundenFrom[therapist.therapistId] = stundenFromInput.value.trim();
+      uiState.stundenFrom[therapist.storeKey] = stundenFromInput.value.trim();
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     });
@@ -1693,7 +1800,7 @@ function bindBodyEvents(therapist) {
   if (stundenToInput) {
     bindDeDateAutoFormat(stundenToInput);
     stundenToInput.addEventListener("change", () => {
-      uiState.stundenTo[therapist.therapistId] = stundenToInput.value.trim();
+      uiState.stundenTo[therapist.storeKey] = stundenToInput.value.trim();
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     });
@@ -1701,7 +1808,7 @@ function bindBodyEvents(therapist) {
 
   body.querySelectorAll(".druckenModeBtn").forEach((btn) => {
     btn.onclick = () => {
-      uiState.druckenMode[therapist.therapistId] = btn.dataset.mode;
+      uiState.druckenMode[therapist.storeKey] = btn.dataset.mode;
       body.innerHTML = renderTherapistBody(therapist);
       bindBodyEvents(therapist);
     };
@@ -1710,7 +1817,7 @@ function bindBodyEvents(therapist) {
   const druckenBereichSelect = body.querySelector(".druckenBereichSelect");
   if (druckenBereichSelect) {
     druckenBereichSelect.onchange = () => {
-      uiState.druckenBereich[therapist.therapistId] = druckenBereichSelect.value;
+      uiState.druckenBereich[therapist.storeKey] = druckenBereichSelect.value;
     };
   }
 
@@ -1718,21 +1825,21 @@ function bindBodyEvents(therapist) {
   if (druckenFromInput) {
     bindDeDateAutoFormat(druckenFromInput);
     druckenFromInput.addEventListener("change", () => {
-      uiState.druckenFrom[therapist.therapistId] = druckenFromInput.value.trim();
+      uiState.druckenFrom[therapist.storeKey] = druckenFromInput.value.trim();
     });
   }
   const druckenToInput = body.querySelector(".druckenToInput");
   if (druckenToInput) {
     bindDeDateAutoFormat(druckenToInput);
     druckenToInput.addEventListener("change", () => {
-      uiState.druckenTo[therapist.therapistId] = druckenToInput.value.trim();
+      uiState.druckenTo[therapist.storeKey] = druckenToInput.value.trim();
     });
   }
 
   const druckenAusfuehrenBtn = body.querySelector("#druckenAusfuehrenBtn");
   if (druckenAusfuehrenBtn) {
     druckenAusfuehrenBtn.onclick = () => {
-      const tid = therapist.therapistId;
+      const tid = therapist.storeKey;
       const msg = body.querySelector("#druckenMsg");
       msg.textContent = "";
       const bereich = uiState.druckenBereich[tid] || DRUCKEN_BEREICHE[0].val;
